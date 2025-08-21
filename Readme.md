@@ -35,20 +35,21 @@ Ensure R is installed and the following packages are available:
 
 ```r
 install.packages(c("shiny", "data.table", "ggplot2", "dplyr", "lubridate", "plotly", "DT"))
-
+```
 ## Running the App
 You can launch the app using R or Rscript:
 
 
 # From R console
+```r
 shiny::runApp("path/to/app.R", launch.browser = TRUE)
-
+```
 # Or via terminal (Windows/macOS/Linux):
 Rscript launch.R
 
 
 Use the provided run_launch.bat or run_launch.sh scripts to auto-detect R, install packages, and launch the app.
-📄 CSV Format Requirements
+ CSV Format Requirements
 
 
 ###Uploaded CSV files should include at least the following columns:
@@ -65,7 +66,8 @@ Use the provided run_launch.bat or run_launch.sh scripts to auto-detect R, insta
 
 ### Contributing
 Pull requests are welcome! If you have ideas for new visualizations, benchmarking logic, or data cleaning modules, feel free to fork and submit.
-📜 License
+
+### License
 MIT License. See the LICENSE file for details.
 
 Built with care by Fidel Maureira, for better science and better feed.
