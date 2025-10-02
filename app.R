@@ -49,12 +49,17 @@ server <- function(input, output, session) {
     start_line <- which(grepl("AnimalTag", lines))  # use [1] to get the first match
     
     # Step 3: Read data from that line onward using fread
-    dt <- fread(input$file$datapath, skip = max(start_line) - 1)
+    if (start_line==1) {
+      dt = fread(input$file$datapath) 
+      }    else {
+        dt <- fread(input$file$datapath, skip = max(start_line) - 1)
+      }
+    
     
     #Clean data without tag
-    dt = na.omit(dt)
-    dt[, StartTime := ymd_hms(StartTime)]
-    dt[, EndTime := ymd_hms(EndTime)]
+    #dt = na.omit(dt)
+    dt[, StartTime := parse_date_time(StartTime, orders = c("mdY HM p", "ymd HMS"))]
+    dt[, EndTime := parse_date_time(EndTime, orders = c("mdY HM p", "ymd HMS"))]
     dt
   })
   
