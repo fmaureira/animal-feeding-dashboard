@@ -5,13 +5,14 @@ library(ggplot2)
 library(dplyr)
 library(lubridate)
 library(plotly)
+library(readxl)
 
 
 ui <- fluidPage(
   titlePanel("Animal Feeding Dashboard"),
-  sidebarLayout(
+ # sidebarLayout(
     sidebarPanel(
-      fileInput("file", "Upload CSV"),
+      fileInput("file", "Upload CSV or Excel"),
       uiOutput("animal_selector"),
       #dateRangeInput("date_range", "Select Date Range")
       uiOutput("date_ui"),
@@ -37,34 +38,67 @@ ui <- fluidPage(
       
     )
   )
-)
+#)
 
 
 server <- function(input, output, session) {
+ #options(shiny.error = browser)
+  
+  # data <- reactive({
+  #   req(input$file)
+  #   lines <- readLines(input$file$datapath)
+  #   
+  #   # Step 2: Find line number where "AnimalTag" appears
+  #   start_line <- which(grepl("AnimalTag", lines))  # use [1] to get the first match
+  #   
+  #   # Step 3: Read data from that line onward using fread
+  #   if (start_line==1) {
+  #     dt = fread(input$file$datapath) 
+  #     }    else {
+  #       dt <- fread(input$file$datapath, skip = max(start_line) - 1)
+  #     }
+  #   
+  #   
+  #   #Clean data without tag
+  #   #dt = na.omit(dt)
+  #   dt[, StartTime := parse_date_time(StartTime, orders = c("mdY HM p", "ymd HMS"))]
+  #   dt[, EndTime := parse_date_time(EndTime, orders = c("mdY HM p", "ymd HMS"))]
+  #   dt
+  # })
   data <- reactive({
     req(input$file)
-    lines <- readLines(input$file$datapath)
+    ext <- tools::file_ext(input$file$name)
     
-    # Step 2: Find line number where "AnimalTag" appears
-    start_line <- which(grepl("AnimalTag", lines))  # use [1] to get the first match
-    
-    # Step 3: Read data from that line onward using fread
-    if (start_line==1) {
-      dt = fread(input$file$datapath) 
-      }    else {
-        dt <- fread(input$file$datapath, skip = max(start_line) - 1)
+    if (tolower(ext) %in% c("xlsx", "xls")) {
+      # Read Excel file
+      dt <- as.data.table(read_excel(input$file$datapath))
+    } else {
+      # Read text-based file and find header line
+      lines <- readLines(input$file$datapath)
+      start_line <- which(grepl("AnimalTag", lines))
+      
+      if (length(start_line) == 0) {
+        stop("Header line with 'AnimalTag' not found.")
       }
+      
+      if (start_line[1] == 1) {
+        dt <- fread(input$file$datapath)
+      } else {
+        dt <- fread(input$file$datapath, skip = start_line[1] - 1)
+      }
+    }
     
-    
-    #Clean data without tag
-    #dt = na.omit(dt)
-    dt[, StartTime := parse_date_time(StartTime, orders = c("mdY HM p", "ymd HMS"))]
-    dt[, EndTime := parse_date_time(EndTime, orders = c("mdY HM p", "ymd HMS"))]
+    # Parse datetime columns
+    dt[, StartTime := parse_date_time(StartTime, orders = c("mdY HM p", "ymd HMS","ymd"))]
+    dt[, EndTime := parse_date_time(EndTime, orders = c("mdY HM p", "ymd HMS","ymd"))]
+    dt[, AnimalTag := as.character(AnimalTag)]
+    #print(head(dt))
     dt
   })
   
   output$date_ui <- renderUI({
     req(data())
+    if (nrow(data()) == 0) return(NULL)  # prevents rendering empty table
     min_date <- min(data()$StartTime, na.rm = TRUE)
     max_date <- max(data()$StartTime, na.rm = TRUE)
     
@@ -91,6 +125,7 @@ server <- function(input, output, session) {
     df <- data()#[AnimalTag == input$animal_tag]
     df <- df[as.Date(StartTime) >= (input$date_range[1]) & as.Date(StartTime) <= (input$date_range[2])]
     df <- df[order(StartTime)]
+    if (nrow(df) == 0) return(NULL)  # prevents rendering empty table
     # Append to existing Flags column
     #This expression compares the end time of the previous row to the start time of the current row. If the previous event ends after the current one starts, then the two events overlap.
 
@@ -120,9 +155,10 @@ server <- function(input, output, session) {
     
       
       
-    df[, Flags := ifelse(overlap_flag,
-                         paste(Flags, "Overlap", sep = "; "),
-                         Flags)]
+    df[, Flags := fifelse(overlap_flag,
+                          ifelse(is.na(Flags), "Overlap", paste(Flags, "Overlap", sep = "; ")),
+                          as.character(Flags))]
+    
     
     df
   })
@@ -130,7 +166,7 @@ server <- function(input, output, session) {
   mass_summary <- reactive({
     df <- filtered_data()[order(StartTime)] %>%
       filter(AnimalTag == input$animal_tag)
-    
+    if (nrow(df) == 0) return(NULL)  # prevents rendering empty table
     #df[, overlap := shift(EndTime, type = "lag") > StartTime]
     
     # Merge scenario
@@ -179,12 +215,14 @@ server <- function(input, output, session) {
   
   output$feeding_plot <- renderPlotly({
     #df <- filtered_data()
-    df <- resolved_data() %>%
+    df <- req(resolved_data()$df) %>%
       filter(AnimalTag == input$animal_tag) %>%
       mutate(Flags = ifelse(is.na(Flags)| Flags=='','',Flags),
              overlap_id = ifelse(is.na(overlap_id),0,overlap_id))
+    
+    if (nrow(df) == 0) return(NULL)  # prevents rendering empty table
     overlaps = max(df$overlap_id, na.rm=T)
-    print(overlaps)
+   #print(overlaps)
     df[,overlap_id := as.factor(overlap_id)]
     
     p1 = ggplot(df, aes(x = StartTime, y = MassDiffKg)) +
@@ -209,64 +247,82 @@ server <- function(input, output, session) {
   
   #
   resolved_data <- reactive({
-  df <- req(filtered_data())
-  df <- df[order(StartTime)]
-  #df[, overlap := shift(EndTime, type = "lag") > StartTime]
+    req(input$overlap_action)
+    df <- req(filtered_data())
+    df <- df[order(StartTime)]
+    if (nrow(df) == 0) return(NULL)  # prevents rendering empty table
+    #df[, overlap := shift(EndTime, type = "lag") > StartTime]
+    df[, StartTime := format(StartTime, "%Y-%m-%d %H:%M:%S")]
+    df[, EndTime := format(EndTime, "%Y-%m-%d %H:%M:%S")]
+    if (input$overlap_action == "merge") {
+      merge_df <- df[!is.na(overlap_id)]
+      
+      # merged_rows <- merge_df %>%
+      #   group_by(AnimalTag, overlap_id) %>%
+      #   summarise(
+      #     overlap_flag = first(overlap_flag),
+      #     StartTime = min(StartTime, na.rm = TRUE),
+      #     EndTime = max(EndTime, na.rm = TRUE),
+      #     DurationSec = sum(DurationSec, na.rm = TRUE),
+      #     MassDiffKg = sum(MassDiffKg, na.rm = TRUE),
+      #     Feeder = Feeder[which.max(MassDiffKg)]
+      #   )
+      merged_rows <- merge_df %>%
+        group_by(AnimalTag, overlap_id) %>%
+        mutate(
+          StartTime = min(StartTime, na.rm = TRUE),
+          EndTime = max(EndTime, na.rm = TRUE),
+          DurationSec = sum(DurationSec, na.rm = TRUE),
+          MassDiffKg = sum(MassDiffKg, na.rm = TRUE),
+          StartMassKg = min(StartMassKg,na.rm=TRUE),
+          EndMassKg = max(EndMassKg,na.rm=TRUE),
+          Flags = 'Merged'
+        ) %>%
+        slice_max(MassDiffKg, n = 1, with_ties = FALSE) %>%
+        ungroup()
+      
+      
+      df = bind_rows(df[is.na(overlap_id)],merged_rows)
+      setorder(df, StartTime)
+      list(df = df, solved_df = merge_df)
+      
+      } else if (input$overlap_action == "delete") {
+      # df <- df[!(overlap_flag & MassDiffKg < shift(MassDiffKg)),
+      #          by = overlap_id]
+        
+        # Separate overlapping and non-overlapping rows
+        non_overlap <- df[is.na(overlap_id)]
+        overlap <- df[!is.na(overlap_id)]
+        
+        # For each overlap group, keep only the row with the largest MassDiffKg
+        overlap <- overlap[, .SD[which.max(MassDiffKg)], by = c("AnimalTag","overlap_id")]
+        overlap[,Flags:='Deleted of small MassDiffKg']
+        # Combine back with non-overlapping rows
+        resolved_df <- rbindlist(list(non_overlap, overlap), use.names = TRUE)
+        setorder(resolved_df, StartTime)
+        
+        
+        df <- resolved_df
+        list(df = df, solved_df = overlap)
+      } else {
+        list (df=df, solved_df=df[!is.na(overlap_id)])
+      }
+    
   
-  if (input$overlap_action == "merge") {
-    merge_df <- df[!is.na(overlap_id)]
-    
-    # Aggregate by overlap_id
-    # merged_rows <- merge_df[, .(
-    #   AnimalTag = first(AnimalTag),
-    #   overlap_flag = first(overlap_flag),
-    #   StartTime = min(StartTime),
-    #   EndTime = max(EndTime),
-    #   DurationSec = sum(DurationSec, na.rm = TRUE),
-    #   MassDiffKg = sum(MassDiffKg, na.rm = TRUE),
-    #   Feeder = Feeder[which.max(MassDiffKg)]  # Feeder with largest MassDiffKg
-    # ), by = c(AnimalTag,overlap_id)]
-    
-    merged_rows <- merge_df %>%
-      group_by(AnimalTag, overlap_id) %>%
-      summarise(
-        overlap_flag = first(overlap_flag),
-        StartTime = min(StartTime, na.rm = TRUE),
-        EndTime = max(EndTime, na.rm = TRUE),
-        DurationSec = sum(DurationSec, na.rm = TRUE),
-        MassDiffKg = sum(MassDiffKg, na.rm = TRUE),
-        Feeder = Feeder[which.max(MassDiffKg)]
-      )
-    
-    df = bind_rows(df[is.na(overlap_id)],merged_rows)
-    
-    } else if (input$overlap_action == "delete") {
-    # df <- df[!(overlap_flag & MassDiffKg < shift(MassDiffKg)),
-    #          by = overlap_id]
-      
-      # Separate overlapping and non-overlapping rows
-      non_overlap <- df[is.na(overlap_id)]
-      overlap <- df[!is.na(overlap_id)]
-      
-      # For each overlap group, keep only the row with the largest MassDiffKg
-      overlap_resolved <- overlap[, .SD[which.max(MassDiffKg)], by = c("AnimalTag","overlap_id")]
-      
-      # Combine back with non-overlapping rows
-      resolved_df <- rbindlist(list(non_overlap, overlap_resolved), use.names = TRUE)
-      setorder(resolved_df, StartTime)
-      df <- resolved_df
-  }
-  df
 })
   
   
 #Download data ####
   output$download_data <- downloadHandler(
+    
     filename = function() {
       paste("resolved_data_", Sys.Date(), ".csv", sep = "")
     },
     content = function(file) {
-      fwrite(resolved_data(), file)
+      fwrite(resolved_data()$df %>%
+               mutate(Short = format(Short, "%Y-%m-%d"),
+                      StartTime = format(StartTime, "%Y-%m-%d %H:%M:%S"))%>%
+               dplyr::select(-overlap_flag,-overlap_id), file)
     }
   )
   
@@ -289,37 +345,63 @@ server <- function(input, output, session) {
   ####3
   output$accumulated_plot <- renderPlot({
     #df <- data()[StartTime >= input$date_range[1] & StartTime <= input$date_range[2]]
-    df <- req(resolved_data())
+    df <- resolved_data()$df
+    #if (nrow(df) == 0) return(NULL)  # prevents rendering empty plot
+    df[,StartTime:=as.POSIXct(StartTime)]
     df <- df[order(StartTime)]
-    df[, AccumulatedMass := cumsum(MassDiffKg), by = AnimalTag]
- 
-    all_df <- df#data()[as.Date(StartTime) >= input$date_range[1] & as.Date(StartTime) <= input$date_range[2]] 
-    
-    all_df[, AccumulatedMass := cumsum(MassDiffKg), by = AnimalTag]
-    summary_stats <- all_df %>%
-      as.data.frame() %>%
-      mutate(StartTime = floor_date(StartTime, unit = "4hour")) %>%  # Round down
-      group_by(StartTime) %>%
-      summarise(mean = mean(AccumulatedMass, na.rm=T), 
-                p25 = quantile(AccumulatedMass, 0.25, na.rm=T), 
-                p75 = quantile(AccumulatedMass, 0.75, na.rm=T),
-                AnimalTag = 'Peer Mean (p25-p75)')
-    
-    ggplot() +
-      geom_line(data = df[AnimalTag == input$animal_tag],
-                aes(x = StartTime, y = AccumulatedMass, col=   factor(AnimalTag))) +
-      geom_ribbon(data = summary_stats, aes(x = StartTime, ymin = p25, ymax = p75), fill = "grey80", alpha = 0.5) +
-      geom_line(data = summary_stats, aes(x=StartTime, y = mean,  col=   factor(AnimalTag)),  alpha=0.8) +
-      labs(title = "Cumulative Intake vs Peer Range", x = "Time", y = "Cumulative Intake (Kg)",
-           col='')+
-      theme_minimal()
+    if (nrow(df)>0) { 
+      df[, AccumulatedMass := cumsum(MassDiffKg), by = AnimalTag]
+   
+      #all_df <- df#data()[as.Date(StartTime) >= input$date_range[1] & as.Date(StartTime) <= input$date_range[2]] 
+      
+      #all_df[, AccumulatedMass := cumsum(MassDiffKg), by = AnimalTag]
+      summary_stats <- df %>%
+        as.data.frame() %>%
+        #mutate(StartTime = floor_date(StartTime, unit = "hour")) %>%  # Round down
+        mutate(
+          StartTime = suppressWarnings(
+            if ("StartTime" %in% names(.)) {
+              if (inherits(StartTime, "POSIXt")) {
+                floor_date(StartTime, unit = "4hour")
+              } else {
+                warning("StartTime is not a POSIXt object")
+                NA
+              }
+            } else {
+              warning("StartTime column not found")
+              NA
+            }
+          )
+        ) %>%
+      
+        group_by(StartTime) %>%
+        summarise(mean = mean(AccumulatedMass, na.rm=T), 
+                  sd= sd(AccumulatedMass, na.rm=T),
+                  p25 = mean-2*sd,#quantile(AccumulatedMass, 0.25, na.rm=T), 
+                  p75 = mean+2*sd,#quantile(AccumulatedMass, 0.75, na.rm=T),
+                  AnimalTag = 'Peer Mean +-2xsd')
+      
+      ggplot() +
+        geom_line(data = df[AnimalTag %in% input$animal_tag],
+                  aes(x = StartTime, y = AccumulatedMass, col=   factor(AnimalTag))) +
+        geom_ribbon(data = summary_stats, aes(x = StartTime, ymin = p25, ymax = p75), fill = "grey80", alpha = 0.5) +
+        geom_line(data = summary_stats, aes(x=StartTime, y = mean,  col=   factor(AnimalTag)),  alpha=0.8) +
+        labs(title = "Cumulative Intake vs Peer Range", x = "Time", y = "Cumulative Intake (Kg)",
+             col='')+
+        theme_minimal() 
+    } else {
+      ggplot()+ geom_blank()
+    }
   })
   
   
   output$total_mass_plot <- renderPlot({
     
-    
-    df <- req(data())[as.Date(StartTime) >= input$date_range[1] & as.Date(StartTime) <= input$date_range[2]]
+    req(input$animal_tag)
+    req(input$date_range)
+    df <- req(data())[as.Date(StartTime) >= input$date_range[1] & 
+                        as.Date(StartTime) <= input$date_range[2]]
+    if (nrow(df) == 0) return(NULL)  # prevents rendering empty table
     
     # Total mass per animal
     summary_df <- df[, .(TotalMass = sum(MassDiffKg)), by = AnimalTag]
@@ -334,7 +416,7 @@ server <- function(input, output, session) {
     
     # Selected animal data
     #selected_df <- summary_df[AnimalTag == input$animal_tag]
-    selected_df = resolved_data() %>%
+    selected_df = req(resolved_data()$df) %>%
       as.data.frame() %>%
       filter(AnimalTag == input$animal_tag) %>%
       mutate(AnimalTag = as.character(AnimalTag)) %>%
@@ -377,8 +459,10 @@ server <- function(input, output, session) {
   
   
   output$summary_table <- renderTable({
-    df <- req(resolved_data()) %>%
+    df <- req(resolved_data()$df) %>%
       filter(AnimalTag == input$animal_tag)
+    if (nrow(df) == 0) return(NULL)  # prevents rendering empty table
+    
     df %>%
       summarise(
         TotalSessions = .N,
@@ -391,34 +475,44 @@ server <- function(input, output, session) {
   
   
   output$overlap_table <- DT::renderDataTable({
-    
+    req(input$overlap_action)
+    req(filtered_data())
+    req(resolved_data())
     #
     if (input$overlap_action == "original") {
-      df <- req(filtered_data())[order(StartTime)] 
-      }else {
-      df <- resolved_data()[order(StartTime)]
-      }
-    df[, StartTime := format(StartTime, "%Y-%m-%d %H:%M:%S")]
-    df[, EndTime := format(EndTime, "%Y-%m-%d %H:%M:%S")]
-    
-    df <- df[overlap_flag == TRUE] %>%
-      filter(AnimalTag == input$animal_tag)
-    
-    # Assign a color per overlap_id
-    df[, row_color := as.character(factor(overlap_id))]
-    
-    DT::datatable(df[, .(overlap_id,AnimalTag, Feeder, StartTime, EndTime, DurationSec,MassDiffKg,Flags)],
-                  options = list(rowCallback = DT::JS(
-                    "function(row, data, index) {",
-                    "  var colors = ['#f2f2f2', '#d9edf7', '#fcf8e3', '#fbeed5', '#dff0d8'];",
-                    "  var id = data[0];",  # overlap_id is the 5th column (0-indexed)
-                    "  if (id !== null && id !== '') {",
-                    "    var color = colors[parseInt(id) % colors.length];",
-                    "    $(row).css('background-color', color);",
-                    "  }",
-                    "}"
-                  ))
+        df <- req(filtered_data())[order(StartTime)] 
+        }else {
+        df <- resolved_data()$df[order(StartTime)]
+        if (nrow(df)==0) {
+          df <- resolved_data()$solved_df
+        }
+        }
+    if (nrow(df) == 0) {
+      return(NULL)  # prevents rendering empty table
+    } else {
+      #df[, StartTime := format(StartTime, "%Y-%m-%d %H:%M:%S")]
+      #df[, EndTime := format(EndTime, "%Y-%m-%d %H:%M:%S")]
+      
+      df <- df[overlap_flag == TRUE] %>%
+        filter(AnimalTag == input$animal_tag)
+      
+      # Assign a color per overlap_id
+      df[, row_color := as.character(factor(overlap_id))]
+      
+      DT::datatable(df[, .(overlap_id,AnimalTag, Feeder, StartTime, EndTime, DurationSec,MassDiffKg,Flags)],
+                    options = list(rowCallback = DT::JS(
+                      "function(row, data, index) {",
+                      "  var colors = ['#f2f2f2', '#d9edf7', '#fcf8e3', '#fbeed5', '#dff0d8'];",
+                      "  var id = data[0];",  # overlap_id is the 5th column (0-indexed)
+                      "  if (id !== null && id !== '') {",
+                      "    var color = colors[parseInt(id) % colors.length];",
+                      "    $(row).css('background-color', color);",
+                      "  }",
+                      "}"
+                    ))
+      )
+    }
+    }
     )
-  })
 }
 shinyApp(ui = ui, server = server, options = list(launch.browser = TRUE))
