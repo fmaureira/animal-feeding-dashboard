@@ -6,7 +6,7 @@ library(dplyr)
 library(lubridate)
 library(plotly)
 library(readxl)
-
+options(shiny.maxRequestSize = 1000*1024^2) #a GB to upload
 
 ui <- fluidPage(
   titlePanel("Animal Feeding Dashboard"),
