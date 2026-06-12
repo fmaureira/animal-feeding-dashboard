@@ -4,3 +4,7 @@
 .Ruserdata
 test_dataset.R
 nul
+example/
+example/*.csv
+example/*.xlsx
+.claude/

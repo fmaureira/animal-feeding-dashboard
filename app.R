@@ -6,6 +6,8 @@ library(dplyr)
 library(lubridate)
 library(plotly)
 library(readxl)
+library(winch)
+source('functions.R')
 options(shiny.maxRequestSize = 1000*1024^2) #a GB to upload
 
 ui <- fluidPage(
@@ -23,9 +25,10 @@ ui <- fluidPage(
       
       
       
-      downloadButton("download_data", "Download Resolved Dataset")
-      
-      
+      downloadButton("download_data", "Download Resolved Dataset"),
+      downloadButton("download_visits", "Download Visit Summary")
+
+
     ),
     mainPanel(
       plotlyOutput("feeding_plot"),
@@ -33,38 +36,22 @@ ui <- fluidPage(
       #tableOutput("overlap_table"),
       DT::dataTableOutput("overlap_table"),
       plotOutput("accumulated_plot"),
-      plotOutput("total_mass_plot")
+      plotOutput("total_mass_plot"),
+      h4("Meal-Interval Mixture Model"),
+      plotOutput("meal_mixture_plot"),
+      h4("Daily Visits (selected animal)"),
+      plotOutput("animal_visits_plot"),
+      h4("Visit Summary (all animals)"),
+      tableOutput("visit_summary")
       #tableOutput("debug")
-      
+
     )
   )
 #)
 
 
 server <- function(input, output, session) {
- #options(shiny.error = browser)
-  
-  # data <- reactive({
-  #   req(input$file)
-  #   lines <- readLines(input$file$datapath)
-  #   
-  #   # Step 2: Find line number where "AnimalTag" appears
-  #   start_line <- which(grepl("AnimalTag", lines))  # use [1] to get the first match
-  #   
-  #   # Step 3: Read data from that line onward using fread
-  #   if (start_line==1) {
-  #     dt = fread(input$file$datapath) 
-  #     }    else {
-  #       dt <- fread(input$file$datapath, skip = max(start_line) - 1)
-  #     }
-  #   
-  #   
-  #   #Clean data without tag
-  #   #dt = na.omit(dt)
-  #   dt[, StartTime := parse_date_time(StartTime, orders = c("mdY HM p", "ymd HMS"))]
-  #   dt[, EndTime := parse_date_time(EndTime, orders = c("mdY HM p", "ymd HMS"))]
-  #   dt
-  # })
+ 
   data <- reactive({
     req(input$file)
     ext <- tools::file_ext(input$file$name)
@@ -88,14 +75,15 @@ server <- function(input, output, session) {
       }
     }
     
-    # Parse datetime columns
-    dt[, StartTime := parse_date_time(StartTime, orders = c("mdY HM p", "ymd HMS","ymd"))]
-    dt[, EndTime := parse_date_time(EndTime, orders = c("mdY HM p", "ymd HMS","ymd"))]
+    # Parse datetime columns, reconciling any StartTime/EndTime timezone
+    # mismatch (e.g. local StartTime vs. UTC "Z" EndTime) via DurationSec.
+    dt <- parse_feeding_times(dt)
     dt[, AnimalTag := as.character(AnimalTag)]
-    #print(head(dt))
+    dt[, Feeder := as.character(Feeder)]
+
     dt
   })
-  
+  #Get date to display
   output$date_ui <- renderUI({
     req(data())
     if (nrow(data()) == 0) return(NULL)  # prevents rendering empty table
@@ -122,46 +110,16 @@ server <- function(input, output, session) {
   # })
   filtered_data <- reactive({
     req(input$animal_tag, input$date_range)
+    
     df <- data()#[AnimalTag == input$animal_tag]
-    df <- df[as.Date(StartTime) >= (input$date_range[1]) & as.Date(StartTime) <= (input$date_range[2])]
-    df <- df[order(StartTime)]
-    if (nrow(df) == 0) return(NULL)  # prevents rendering empty table
-    # Append to existing Flags column
-    #This expression compares the end time of the previous row to the start time of the current row. If the previous event ends after the current one starts, then the two events overlap.
-
-    df[, `:=`(overlap_flag = FALSE, overlap_id = NA_integer_)]
+    #Define overlap
     
-    df[, c("overlap_flag", "overlap_id") := {
-      overlap_cond <- (StartTime - shift(EndTime, type='lag')) <= input$tolerance_sec &
-        Feeder != shift(Feeder)
-      flag <- rep(FALSE, .N)
-      id_vec <- rep(NA_integer_, .N)
-      
-      # Find indices where overlap occurs
-      idx <- which(overlap_cond)
-      
-      # Assign flags and IDs to both rows in each overlap
-      for (i in seq_along(idx)) {
-        flag[idx[i]] <- TRUE
-        if (idx[i] > 1) flag[idx[i] - 1] <- TRUE
-        
-        # Assign a unique ID to both rows
-        id_val <- i  # or use another scheme if needed
-        id_vec[idx[i]] <- id_val
-        if (idx[i] > 1) id_vec[idx[i] - 1] <- id_val
-      }
-      list(flag, id_vec)
-    }, by = AnimalTag]
-    
-      
-      
-    df[, Flags := fifelse(overlap_flag,
-                          ifelse(is.na(Flags), "Overlap", paste(Flags, "Overlap", sep = "; ")),
-                          as.character(Flags))]
+    df = identify_overlap(df, input)
     
     
     df
   })
+  
   
   mass_summary <- reactive({
     df <- filtered_data()[order(StartTime)] %>%
@@ -184,14 +142,18 @@ server <- function(input, output, session) {
       EndTime = max(EndTime),
       DurationSec = sum(DurationSec, na.rm = TRUE),
       MassDiffKg = sum(MassDiffKg, na.rm = TRUE),
-      Feeder = Feeder[which.max(MassDiffKg)]  # Feeder with largest MassDiffKg
+      #Feeder = Feeder[which.max(MassDiffKg)]  # Feeder with largest MassDiffKg
+      Feeder = paste(unique(Feeder), collapse = "|") #Add the all feeders
+      
     ), by = overlap_id]
     
     merge_df = bind_rows(df[is.na(overlap_id)],merged_rows)
     merge_total <- sum(merge_df$MassDiffKg, na.rm = TRUE)
+    #setorder(merge_df, AnimalTag, StartTime)
     # Delete scenario
     delete_df <- df[!(overlap_flag & MassDiffKg < shift(MassDiffKg))]
     delete_total <- sum(delete_df$MassDiffKg, na.rm = TRUE)
+    #setorder(delete_total, AnimalTag, StartTime)
     
     list(merge = merge_total, delete = delete_total)
   })
@@ -225,6 +187,12 @@ server <- function(input, output, session) {
    #print(overlaps)
     df[,overlap_id := as.factor(overlap_id)]
     
+    # Count how many shapes you need
+    n_shapes <- length(unique(df$Feeder))
+    
+    # Generate a vector of shapes long enough
+    # Shapes 0–25 are safe, distinct, and printable
+    shape_values <- rep(0:25, length.out = n_shapes)
     p1 = ggplot(df, aes(x = StartTime, y = MassDiffKg)) +
       geom_line() +
       labs(title = "Feed Intake Over Time", x = "Start Time", y = "Mass Diff (Kg)") +
@@ -233,8 +201,10 @@ server <- function(input, output, session) {
     
     if (overlaps>0) {
       p =p1 +geom_point(aes( color = overlap_id,shape=factor(Feeder)), size = 2) +
+        scale_shape_manual(values = shape_values) +
         labs(col='Overlap and Feeder',fill='',
              shape = '')
+        
     
     } else {
       p = p1 +geom_point(aes(color = Flags), size = 1, show.legend = F) +
@@ -283,7 +253,7 @@ server <- function(input, output, session) {
       
       
       df = bind_rows(df[is.na(overlap_id)],merged_rows)
-      setorder(df, StartTime)
+      setorder(df, AnimalTag, StartTime)
       list(df = df, solved_df = merge_df)
       
       } else if (input$overlap_action == "delete") {
@@ -299,7 +269,7 @@ server <- function(input, output, session) {
         overlap[,Flags:='Deleted of small MassDiffKg']
         # Combine back with non-overlapping rows
         resolved_df <- rbindlist(list(non_overlap, overlap), use.names = TRUE)
-        setorder(resolved_df, StartTime)
+        setorder(resolved_df, AnimalTag, StartTime)
         
         
         df <- resolved_df
@@ -312,6 +282,61 @@ server <- function(input, output, session) {
 })
   
   
+  # Meal-interval analysis ####
+  # Builds on the resolved (merged/deleted) dataset: computes the gap between
+  # consecutive meals per animal, fits a 2-component Gaussian mixture to the
+  # log-intervals, derives the meal threshold from the component intersection
+  # and assigns per-animal visit (meal) IDs.
+  meal_data <- reactive({
+    df <- req(resolved_data()$df)
+    if (nrow(df) == 0) return(NULL)
+
+    df <- compute_meal_intervals(df)
+
+    log_intervals <- df$LogInterval[is.finite(df$LogInterval)]
+    fit <- fit_normal_mixture(log_intervals, k = 2)
+    threshold_log <- mixture_intersection(fit)
+
+    df <- assign_visits(df, threshold_log)
+
+    list(df = df, fit = fit, threshold_log = threshold_log,
+         log_intervals = log_intervals)
+  })
+
+
+  output$meal_mixture_plot <- renderPlot({
+    md <- req(meal_data())
+    plot_meal_mixture(md$log_intervals, md$fit, md$threshold_log)
+  })
+
+  output$animal_visits_plot <- renderPlot({
+    md <- req(meal_data())
+    req(input$animal_tag)
+    plot_animal_visits(md$df, input$animal_tag)
+  })
+
+
+  # Visit summary covers every animal in the dataset (not just the selected
+  # one); the same all-animal table is used on screen and for download.
+  visit_summary_data <- reactive({
+    md <- req(meal_data())
+    summarize_visits(md$df)
+  })
+
+  output$visit_summary <- renderTable({
+    req(visit_summary_data())
+  })
+
+  output$download_visits <- downloadHandler(
+    filename = function() {
+      paste0("visit_summary_", Sys.Date(), ".csv")
+    },
+    content = function(file) {
+      fwrite(visit_summary_data(), file)
+    }
+  )
+
+
 #Download data ####
   output$download_data <- downloadHandler(
     
@@ -319,9 +344,14 @@ server <- function(input, output, session) {
       paste("resolved_data_", Sys.Date(), ".csv", sep = "")
     },
     content = function(file) {
-      fwrite(resolved_data()$df %>%
-               mutate(Short = format(Short, "%Y-%m-%d"),
-                      StartTime = format(StartTime, "%Y-%m-%d %H:%M:%S"))%>%
+      # Prefer the meal-augmented dataset (adds IntervalSec, LogInterval,
+      # Visits); fall back to the resolved data if the mixture could not run.
+      out <- meal_data()$df
+      if (is.null(out)) out <- resolved_data()$df
+      fwrite(out %>%
+               mutate(ShortDate = format(as.POSIXct(StartTime), "%Y-%m-%d"),
+                      StartTime  = format(as.POSIXct(StartTime), "%Y-%m-%d %H:%M:%S"),
+                      EndTime    = format(as.POSIXct(EndTime),   "%Y-%m-%d %H:%M:%S")) %>%
                dplyr::select(-overlap_flag,-overlap_id), file)
     }
   )
