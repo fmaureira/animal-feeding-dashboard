@@ -8,3 +8,4 @@ example/
 example/*.csv
 example/*.xlsx
 .claude/
+CLAUDE.md

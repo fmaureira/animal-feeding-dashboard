@@ -8,41 +8,85 @@ library(plotly)
 library(readxl)
 library(winch)
 source('functions.R')
-options(shiny.maxRequestSize = 1000*1024^2) #a GB to upload
+options(shiny.maxRequestSize = 1000*1024^2) #10 GB to upload
 
 ui <- fluidPage(
   titlePanel("Animal Feeding Dashboard"),
  # sidebarLayout(
     sidebarPanel(
       fileInput("file", "Upload CSV or Excel"),
+      uiOutput("id_col_ui"),
       uiOutput("animal_selector"),
       #dateRangeInput("date_range", "Select Date Range")
       uiOutput("date_ui"),
       numericInput("tolerance_sec", "Overlap Tolerance (seconds)", value = 0, min = 0, step = 1),
-      
+
       uiOutput("overlap_ui"),
-      
-      
-      
-      
+
+      # Meal settings ####
+      # Grouped in their own panel, and worded for someone who has never met a
+      # mixture model: every label says what the setting does to the data, not
+      # what it does to the statistics.
+      wellPanel(
+        h4("Meal settings"),
+        helpText(paste("A meal is a run of feeding events with only short breaks",
+                       "in between. These settings decide where one meal ends",
+                       "and the next one starts.")),
+
+        checkboxInput("weight_by_mass",
+                      "Let big feedings count more than small ones",
+                      value = TRUE),
+        helpText("Uses how much the animal actually ate, so a large feeding",
+                 "counts for more than a quick nibble."),
+
+        checkboxInput("dequantise",
+                      "My times are recorded to the whole minute",
+                      value = FALSE),
+        helpText("Tick this if every time in the file ends in :00. The app then",
+                 "spreads those gaps out instead of treating them all as",
+                 "exactly one minute. It is ignored when times have seconds."),
+
+        selectInput("mixture_k", "How many kinds of break to look for",
+                    choices = c("2 - breaks within a meal, and breaks between meals" = 2,
+                                "3 - also separates short pauses inside a meal"      = 3,
+                                "4 - for very detailed data"                         = 4),
+                    selected = 2),
+        helpText("Start with 2. Try 3 if the animals pause in the middle of a",
+                 "meal and those pauses are being counted as new meals.")
+      ),
+
       downloadButton("download_data", "Download Resolved Dataset"),
-      downloadButton("download_visits", "Download Visit Summary")
+      downloadButton("download_visits", "Download Meal Summary"),
+      downloadButton("download_meals", "Download One Row Per Meal")
 
 
     ),
     mainPanel(
-      plotlyOutput("feeding_plot"),
-      tableOutput("summary_table"),
-      #tableOutput("overlap_table"),
-      DT::dataTableOutput("overlap_table"),
-      plotOutput("accumulated_plot"),
-      plotOutput("total_mass_plot"),
-      h4("Meal-Interval Mixture Model"),
-      plotOutput("meal_mixture_plot"),
-      h4("Daily Visits (selected animal)"),
-      plotOutput("animal_visits_plot"),
-      h4("Visit Summary (all animals)"),
-      tableOutput("visit_summary")
+      tabsetPanel(
+        type = "tabs",
+        tabPanel(
+          "Feeding",
+          plotlyOutput("feeding_plot"),
+          tableOutput("summary_table"),
+          plotOutput("accumulated_plot"),
+          plotOutput("total_mass_plot")
+        ),
+        tabPanel(
+          "Overlaps",
+          #tableOutput("overlap_table"),
+          DT::dataTableOutput("overlap_table")
+        ),
+        tabPanel(
+          "Meals",
+          h4("How meals were separated"),
+          textOutput("meal_criterion"),
+          plotOutput("meal_mixture_plot"),
+          h4("Daily Meals (selected animal)"),
+          plotOutput("animal_visits_plot"),
+          h4("Meal Summary (all animals)"),
+          tableOutput("visit_summary")
+        )
+      )
       #tableOutput("debug")
 
     )
@@ -52,29 +96,58 @@ ui <- fluidPage(
 
 server <- function(input, output, session) {
  
-  data <- reactive({
+  # Raw upload, read before the animal identifier is known: the ID column is
+  # chosen by the user, so reading must not assume a particular column name.
+  raw_data <- reactive({
     req(input$file)
     ext <- tools::file_ext(input$file$name)
-    
+
     if (tolower(ext) %in% c("xlsx", "xls")) {
       # Read Excel file
-      dt <- as.data.table(read_excel(input$file$datapath))
+      as.data.table(read_excel(input$file$datapath))
     } else {
-      # Read text-based file and find header line
+      # Read text-based file and find header line. Files that do not carry an
+      # "AnimalTag" column are read from the first line; their identifier
+      # column is picked in the dropdown below.
       lines <- readLines(input$file$datapath)
       start_line <- which(grepl("AnimalTag", lines))
-      
-      if (length(start_line) == 0) {
-        stop("Header line with 'AnimalTag' not found.")
-      }
-      
-      if (start_line[1] == 1) {
-        dt <- fread(input$file$datapath)
+
+      if (length(start_line) == 0 || start_line[1] == 1) {
+        fread(input$file$datapath)
       } else {
-        dt <- fread(input$file$datapath, skip = start_line[1] - 1)
+        fread(input$file$datapath, skip = start_line[1] - 1)
       }
     }
-    
+  })
+
+  # Column holding the animal identifier: likely candidates are suggested
+  # first, but every uploaded column stays selectable.
+  output$id_col_ui <- renderUI({
+    req(raw_data())
+    ch <- id_column_choices(names(raw_data()))
+    choices <- list()
+    if (length(ch$suggested)) choices[["Suggested"]]     <- ch$suggested
+    if (length(ch$others))    choices[["Other columns"]] <- ch$others
+
+    selectInput("id_col", "Animal Identifier Column",
+                choices  = choices,
+                selected = c(ch$suggested, ch$others)[1])
+  })
+
+  data <- reactive({
+    id_col <- req(input$id_col)
+    dt <- copy(req(raw_data()))
+    validate(need(id_col %in% names(dt),
+                  "Selected identifier column is not in the uploaded file."))
+
+    # The rest of the app keys on AnimalTag, so map the chosen column onto it
+    # and keep any pre-existing AnimalTag column under a distinct name.
+    if (!identical(id_col, "AnimalTag")) {
+      if ("AnimalTag" %in% names(dt))
+        setnames(dt, "AnimalTag", "AnimalTag_original")
+      dt[, AnimalTag := get(id_col)]
+    }
+
     # Parse datetime columns, reconciling any StartTime/EndTime timezone
     # mismatch (e.g. local StartTime vs. UTC "Z" EndTime) via DurationSec.
     dt <- parse_feeding_times(dt)
@@ -193,7 +266,8 @@ server <- function(input, output, session) {
     # Generate a vector of shapes long enough
     # Shapes 0–25 are safe, distinct, and printable
     shape_values <- rep(0:25, length.out = n_shapes)
-    p1 = ggplot(df, aes(x = StartTime, y = MassDiffKg)) +
+    p1 = ggplot(df, aes(x = StartTime, y = MassDiffKg),
+    color='#696666') +
       geom_line() +
       labs(title = "Feed Intake Over Time", x = "Start Time", y = "Mass Diff (Kg)") +
       
@@ -285,28 +359,56 @@ server <- function(input, output, session) {
   # Meal-interval analysis ####
   # Builds on the resolved (merged/deleted) dataset: computes the gap between
   # consecutive meals per animal, fits a 2-component Gaussian mixture to the
-  # log-intervals, derives the meal threshold from the component intersection
-  # and assigns per-animal visit (meal) IDs.
+  # log-intervals (optionally weighted by the mass consumed), derives the meal
+  # threshold from the component intersection and assigns per-animal visit
+  # (meal) IDs.
   meal_data <- reactive({
     df <- req(resolved_data()$df)
     if (nrow(df) == 0) return(NULL)
 
     df <- compute_meal_intervals(df)
 
-    log_intervals <- df$LogInterval[is.finite(df$LogInterval)]
-    fit <- fit_normal_mixture(log_intervals, k = 2)
+    # Times stored to the whole minute make every gap a multiple of 60 s, which
+    # pins a component onto a zero-width spike at the rounding step. Spreading
+    # each gap across the step it was rounded to feeds the fit a continuous
+    # distribution; IntervalSec itself is left untouched, so the visits are
+    # still assigned from the recorded gaps.
+    model_sec <- df$IntervalSec
+    if (isTRUE(input$dequantise)) model_sec <- dequantise_intervals(model_sec)
+
+    keep <- is.finite(model_sec) & model_sec > 0
+    log_intervals <- log(model_sec[keep])
+
+    # Optionally weight each interval by the mass eaten in the event that
+    # closes it, so the mixture describes the gaps between kilograms consumed
+    # rather than the gaps between records, and a nibble counts for less than
+    # a full meal. Fall back to an unweighted fit if no mass is recorded.
+    weights <- NULL
+    if (isTRUE(input$weight_by_mass)) {
+      weights <- pmax(df$MassDiffKg[keep], 0)
+      if (!any(is.finite(weights) & weights > 0)) weights <- NULL
+    }
+
+    # More than two components let the long tail split into the several modes
+    # it usually has; the meal threshold still comes from the lowest two.
+    k <- suppressWarnings(as.integer(input$mixture_k))
+    if (!is.finite(k) || k < 2) k <- 2
+
+    fit <- fit_normal_mixture(log_intervals, k = k, w = weights)
     threshold_log <- mixture_intersection(fit)
 
     df <- assign_visits(df, threshold_log)
 
     list(df = df, fit = fit, threshold_log = threshold_log,
-         log_intervals = log_intervals)
+         log_intervals = log_intervals, weights = weights,
+         dequantised = isTRUE(input$dequantise))
   })
 
 
   output$meal_mixture_plot <- renderPlot({
     md <- req(meal_data())
-    plot_meal_mixture(md$log_intervals, md$fit, md$threshold_log)
+    plot_meal_mixture(md$log_intervals, md$fit, md$threshold_log, md$weights,
+                      md$dequantised)
   })
 
   output$animal_visits_plot <- renderPlot({
@@ -316,11 +418,37 @@ server <- function(input, output, session) {
   })
 
 
-  # Visit summary covers every animal in the dataset (not just the selected
+  # Plain-language statement of the rule the whole Meals tab rests on, so the
+  # numbers below it can be read without knowing what a mixture model is.
+  output$meal_criterion <- renderText({
+    md <- req(meal_data())
+    if (is.null(md$fit) || !is.finite(md$threshold_log))
+      return("There was not enough data to work out where meals start and end.")
+
+    extras <- c(if (!is.null(md$weights)) "big feedings counted more than small ones",
+                if (isTRUE(md$dequantised)) "times treated as rounded to the minute")
+
+    paste0("Whenever an animal stopped eating for ",
+           fmt_interval(exp(md$threshold_log)),
+           " or longer, the next feeding was counted as a new meal. ",
+           "Shorter breaks were treated as pauses within the same meal. ",
+           "Worked out from ", length(md$fit$mu), " kinds of break",
+           if (length(extras)) paste0(", with ", paste(extras, collapse = " and ")) else "",
+           ".")
+  })
+
+  # Meal summary covers every animal in the dataset (not just the selected
   # one); the same all-animal table is used on screen and for download.
   visit_summary_data <- reactive({
     md <- req(meal_data())
     summarize_visits(md$df)
+  })
+
+  # One row per meal, for anyone who wants the meals themselves rather than
+  # the per-animal averages.
+  meal_rows_data <- reactive({
+    md <- req(meal_data())
+    summarize_meals(md$df)
   })
 
   output$visit_summary <- renderTable({
@@ -329,10 +457,19 @@ server <- function(input, output, session) {
 
   output$download_visits <- downloadHandler(
     filename = function() {
-      paste0("visit_summary_", Sys.Date(), ".csv")
+      paste0("meal_summary_", Sys.Date(), ".csv")
     },
     content = function(file) {
       fwrite(visit_summary_data(), file)
+    }
+  )
+
+  output$download_meals <- downloadHandler(
+    filename = function() {
+      paste0("meals_", Sys.Date(), ".csv")
+    },
+    content = function(file) {
+      fwrite(meal_rows_data(), file)
     }
   )
 
