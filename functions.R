@@ -102,6 +102,16 @@ parse_feeding_times <- function(dt) {
 # mixture model; non-positive intervals cannot be log-transformed and are NA.
 compute_meal_intervals <- function(df) {
   df <- as.data.table(copy(df))
+
+  # A file that has been through this app before (or through Excel) already
+  # carries these columns, and not necessarily as numbers: an exported
+  # IntervalSec often comes back as text, with "." standing in for the first
+  # row's missing gap. data.table assigns into an existing column rather than
+  # replacing it, so the freshly computed seconds would be coerced back to
+  # text and log() would fail on them. Drop any stale copy and recompute.
+  stale <- intersect(c("IntervalSec", "IntervalNegative", "LogInterval"), names(df))
+  if (length(stale)) df[, (stale) := NULL]
+
   if (!inherits(df$StartTime, "POSIXct")) df[, StartTime := as.POSIXct(StartTime)]
   if (!inherits(df$EndTime, "POSIXct"))   df[, EndTime   := as.POSIXct(EndTime)]
 
@@ -182,17 +192,138 @@ dequantise_intervals <- function(sec, grid = NULL, seed = 1) {
 }
 
 
-# Fit a k-component univariate Gaussian mixture by EM (base R; no external
-# dependencies). Returns components ordered by increasing mean, with the
-# mixing weights (lambda), means (mu), standard deviations (sigma) and the
-# final log-likelihood.
+# ---------------------------------------------------------------------------
+# Weibull component
+# ---------------------------------------------------------------------------
+
+# Weighted maximum-likelihood fit of a Weibull to positive values t. Solves
+# the profile equation for the shape, then reads the scale off it. The values
+# are divided by their maximum first so that t^shape cannot overflow; the
+# scale is put back afterwards.
+#
+# The profile equation is monotone in the shape, so Newton's method converges
+# from any starting point once it is clamped to the bracket. `start` takes the
+# shape from the previous EM round, which brings each re-fit down to two or
+# three passes over the data - a bracketed search would spend a few dozen, and
+# this runs inside every EM iteration.
+fit_weibull_weighted <- function(t, r, start = NULL, max_iter = 50, tol = 1e-10,
+                                 lower = 0.05, upper = 50) {
+  ok <- is.finite(t) & t > 0 & is.finite(r) & r > 0
+  t <- t[ok]; r <- r[ok]
+  if (length(t) < 2) return(NULL)
+  R <- sum(r)
+  if (!is.finite(R) || R <= 0) return(NULL)
+
+  m  <- max(t)
+  u  <- t / m
+  lu <- log(u)
+  rl <- sum(r * lu) / R
+
+  # value and derivative of the profile equation at k
+  fdf <- function(k) {
+    ruk <- r * exp(k * lu)
+    A   <- sum(ruk)
+    if (!is.finite(A) || A <= 0) return(NULL)
+    A1 <- sum(ruk * lu)
+    A2 <- sum(ruk * lu * lu)
+    list(f = A1 / A - 1 / k - rl,
+         d = (A2 * A - A1 * A1) / (A * A) + 1 / (k * k))
+  }
+
+  k <- if (is.null(start) || !is.finite(start) || start <= 0)
+         1 else min(max(start, lower), upper)
+  for (i in seq_len(max_iter)) {
+    v <- fdf(k)
+    if (is.null(v) || !is.finite(v$f) || !is.finite(v$d) || v$d <= 0) return(NULL)
+    k_new <- min(max(k - v$f / v$d, lower), upper)
+    done  <- abs(k_new - k) < tol * max(1, k)
+    k     <- k_new
+    if (done) break
+  }
+
+  shape <- k
+  scale <- m * (sum(r * exp(shape * lu)) / R)^(1 / shape)
+  if (!is.finite(shape) || !is.finite(scale) || scale <= 0) return(NULL)
+  list(shape = shape, scale = scale)
+}
+
+
+# Density of each component at xs, already multiplied by its mixing weight, as
+# a matrix with one column per component. A Weibull component describes the
+# gaps in real time, so on the log axis the plots and the likelihood use it
+# through the change of variables f(exp(x)) * exp(x).
+component_densities <- function(fit, xs) {
+  fams <- if (is.null(fit$families)) rep("normal", length(fit$mu)) else fit$families
+  out <- vapply(seq_along(fit$mu), function(j) {
+    if (fams[j] == "weibull") {
+      tt <- exp(xs)
+      fit$lambda[j] * dweibull(tt, fit$shape, fit$scale) * tt
+    } else {
+      fit$lambda[j] * dnorm(xs, fit$mu[j], fit$sigma[j])
+    }
+  }, numeric(length(xs)))
+  matrix(out, nrow = length(xs), ncol = length(fit$mu))
+}
+
+
+# How well the fitted curve actually describes the data it was fitted to.
+# R2 compares the combined curve with the histogram the reader sees (the same
+# bins the figure draws), which is the question "does the line follow the
+# bars". BIC judges the model itself and is only comparable between fits of
+# the same data under the same weighting - use it to choose between 2, 3 or 4
+# components, or between the normal and Weibull versions.
+mixture_fit_quality <- function(x, weights = NULL, fit, bins = 60) {
+  keep <- is.finite(x)
+  if (!is.null(weights)) keep <- keep & is.finite(weights) & weights > 0
+  xx <- x[keep]
+  wt <- if (is.null(weights)) rep(1, length(xx)) else weights[keep]
+  if (length(xx) == 0 || is.null(fit) || diff(range(xx)) == 0) return(NULL)
+
+  brks <- seq(min(xx), max(xx), length.out = bins + 1)
+  bin  <- cut(xx, breaks = brks, include.lowest = TRUE)
+  bw   <- tapply(wt, bin, sum)
+  bw[is.na(bw)] <- 0
+  obs  <- as.numeric(bw) / (sum(wt) * diff(brks))
+  mid  <- (brks[-1] + brks[-length(brks)]) / 2
+  pred <- rowSums(component_densities(fit, mid))
+
+  ss_res <- sum((obs - pred)^2)
+  ss_tot <- sum((obs - mean(obs))^2)
+  n_par  <- 3 * length(fit$mu) - 1
+
+  list(r2   = if (ss_tot > 0) 1 - ss_res / ss_tot else NA_real_,
+       rmse = sqrt(mean((obs - pred)^2)),
+       bic  = -2 * fit$loglik + n_par * log(fit$n),
+       aic  = -2 * fit$loglik + 2 * n_par)
+}
+
+
+# Fit a k-component univariate mixture by EM (base R; no external
+# dependencies). Returns components ordered by increasing centre, with the
+# mixing weights (lambda), centres (mu), widths (sigma) and the final
+# log-likelihood.
 #
 # `w` optionally gives each observation a weight, so the mixture describes the
 # distribution per unit of weight rather than per event. Weighting the meal
 # intervals by the mass eaten in the event that follows lets a 2 kg meal count
-# for more than a 20 g nibble, which is the intended use here. Observations
-# with a zero or non-finite weight drop out of the fit.
-fit_normal_mixture <- function(x, k = 2, w = NULL, max_iter = 1000, tol = 1e-7) {
+# for more than a 20 g nibble. Observations with a zero or non-finite weight
+# drop out of the fit.
+#
+# `family` chooses the shape of the first (shortest) component:
+#   "normal"  - every component is a normal on the log-interval axis, the
+#               familiar meal-criterion model.
+#   "weibull" - the shortest component is a Weibull in real time, which lets
+#               the within-meal gaps be skewed rather than symmetric once
+#               logged. It enters the mixture through the change of variables
+#               f(exp(x)) * exp(x), so the likelihood and the figure stay on
+#               the same log axis as the normal components and the two
+#               families can be compared directly (see mixture_fit_quality).
+# For a Weibull component mu and sigma are reported as its median and the
+# standard deviation of log(gap), so it can be ordered and labelled alongside
+# the normal ones; shape and scale are returned as well.
+fit_normal_mixture <- function(x, k = 2, w = NULL, family = c("normal", "weibull"),
+                               max_iter = 1000, tol = 1e-7) {
+  family <- match.arg(family)
   if (is.null(w)) w <- rep(1, length(x))
   if (length(w) != length(x)) stop("w must be the same length as x")
 
@@ -221,28 +352,77 @@ fit_normal_mixture <- function(x, k = 2, w = NULL, max_iter = 1000, tol = 1e-7) 
   # which the data itself is flattened to a line.
   sigma_min <- max(1e-3, 0.05 * w_sd)
 
+  # Collapse repeated values before iterating. Every sum in the loop below
+  # reaches x only through the distinct values and the weight standing behind
+  # each of them, so adding the weights of equal values up front gives the
+  # same fit from far less arithmetic. Intervals are whole seconds, so a
+  # season of records holds only tens of thousands of distinct log-intervals
+  # out of hundreds of thousands of rows. The starting values above are still
+  # taken from the full sample, so only the arithmetic changes, not the fit.
+  if (anyDuplicated(x)) {
+    agg <- data.table(x = x, w = w)[, .(w = sum(w)), by = x]
+    xf <- agg$x
+    wf <- agg$w
+  } else {
+    xf <- x
+    wf <- w
+  }
+
+  fams <- rep("normal", k)
+  shape <- NA_real_
+  scale <- NA_real_
+  tf <- NULL
+  if (family == "weibull") {
+    fams[1] <- "weibull"
+    tf <- exp(xf)                       # the gaps themselves, in seconds
+    # Start from the Weibull that matches the first component's starting
+    # normal: equal spread of log(gap) and the same median.
+    shape <- (pi / sqrt(6)) / sigma[1]
+    scale <- exp(mu[1]) / log(2)^(1 / shape)
+  }
+
+  dens <- matrix(0, length(xf), k)
   for (iter in seq_len(max_iter)) {
     # E-step: responsibilities
-    dens <- sapply(seq_len(k), function(j) lambda[j] * dnorm(x, mu[j], sigma[j]))
+    for (j in seq_len(k)) {
+      dens[, j] <- if (fams[j] == "weibull")
+        lambda[j] * dweibull(tf, shape, scale) * tf
+      else
+        lambda[j] * dnorm(xf, mu[j], sigma[j])
+    }
     dens[dens < 1e-300] <- 1e-300
     tot  <- rowSums(dens)
     resp <- dens / tot
 
     # M-step, with every sum taken over the observation weights
-    Nk     <- colSums(resp * w)
+    rw     <- resp * wf
+    Nk     <- colSums(rw)
     lambda <- Nk / W
-    mu     <- colSums(resp * w * x) / Nk
-    sigma  <- sqrt(colSums(resp * w * (outer(x, mu, "-")^2)) / Nk)
-    sigma[!is.finite(sigma) | sigma < sigma_min] <- sigma_min
+    for (j in seq_len(k)) {
+      if (fams[j] == "weibull") {
+        wb <- fit_weibull_weighted(tf, rw[, j], start = shape)
+        if (!is.null(wb)) {
+          shape <- wb$shape
+          scale <- wb$scale
+        }
+        mu[j]    <- log(scale) + log(log(2)) / shape   # median, on the log axis
+        sigma[j] <- (pi / sqrt(6)) / shape             # sd of log(gap)
+      } else {
+        mu[j]    <- sum(rw[, j] * xf) / Nk[j]
+        sigma[j] <- sqrt(sum(rw[, j] * (xf - mu[j])^2) / Nk[j])
+        if (!is.finite(sigma[j]) || sigma[j] < sigma_min) sigma[j] <- sigma_min
+      }
+    }
 
-    ll <- sum(w * log(tot))
+    ll <- sum(wf * log(tot))
     if (is.finite(ll) && abs(ll - ll_old) < tol) break
     ll_old <- ll
   }
 
   ord <- order(mu)
   list(lambda = lambda[ord], mu = mu[ord], sigma = sigma[ord],
-       loglik = ll, k = k, n = n, weighted = !all(w == w[1]))
+       loglik = ll, k = k, n = n, weighted = !all(w == w[1]),
+       family = family, families = fams[ord], shape = shape, scale = scale)
 }
 
 
@@ -264,6 +444,23 @@ mixture_intersection <- function(fit) {
 
   j_top <- length(fit$mu)      # between-meal population
   j_sub <- j_top - 1L          # last within-meal population
+
+  # A Weibull component has no closed-form crossing with a normal, so when
+  # either of the two is not normal the same point is found numerically: the
+  # crossing is where one weighted component density overtakes the other,
+  # which is a sign change of their log difference between the two centres.
+  fams <- if (is.null(fit$families)) rep("normal", length(fit$mu)) else fit$families
+  if (!all(fams[c(j_sub, j_top)] == "normal")) {
+    lo <- min(fit$mu[j_sub], fit$mu[j_top])
+    hi <- max(fit$mu[j_sub], fit$mu[j_top])
+    gap <- function(z) {
+      d <- component_densities(fit, z)
+      log(pmax(d[, j_sub], 1e-300)) - log(pmax(d[, j_top], 1e-300))
+    }
+    if (!is.finite(lo) || !is.finite(hi) || hi <= lo) return((lo + hi) / 2)
+    if (gap(lo) * gap(hi) > 0) return((lo + hi) / 2)
+    return(uniroot(gap, c(lo, hi), tol = 1e-8)$root)
+  }
 
   mu1 <- fit$mu[j_sub];     mu2 <- fit$mu[j_top]
   s1  <- fit$sigma[j_sub];  s2  <- fit$sigma[j_top]
@@ -298,6 +495,9 @@ mixture_intersection <- function(fit) {
 # scale; it is compared against IntervalSec via exp().
 assign_visits <- function(df, threshold_log) {
   df <- as.data.table(copy(df))
+  # Same reason as in compute_meal_intervals: a re-uploaded file may already
+  # carry a Visits column, which would swallow the meal ids computed here.
+  if ("Visits" %in% names(df)) df[, Visits := NULL]
   setorder(df, AnimalTag, StartTime)
   thr_sec <- if (is.finite(threshold_log)) exp(threshold_log) else Inf
 
@@ -368,19 +568,19 @@ plot_meal_mixture <- function(log_intervals, fit, threshold_log, weights = NULL,
   brks <- seq(min(x), max(x), length.out = bins + 1)
   xs   <- seq(min(x), max(x), length.out = 512)
 
+  fams  <- if (is.null(fit$families)) rep("normal", length(fit$mu)) else fit$families
+  dens_j <- component_densities(fit, xs)
+
   comps <- do.call(rbind, lapply(seq_along(fit$mu), function(j) {
     data.frame(x = xs,
-               density   = fit$lambda[j] * dnorm(xs, fit$mu[j], fit$sigma[j]),
-               Component = paste0("Component ", j, " (centre ",
-                                  fmt_interval(exp(fit$mu[j])), ", ",
-                                  round(100 * fit$lambda[j]), "%)"))
+               density   = dens_j[, j],
+               Component = paste0("Part ", j, ": ", fmt_interval(exp(fit$mu[j])),
+                                  " gaps, ", round(100 * fit$lambda[j]), "% of the data",
+                                  if (fams[j] == "weibull") " (Weibull)" else ""))
   }))
-  # Combined mixture density (the curve the histogram should follow)
-  mix <- data.frame(
-    x = xs,
-    density = rowSums(sapply(seq_along(fit$mu), function(j)
-      fit$lambda[j] * dnorm(xs, fit$mu[j], fit$sigma[j])))
-  )
+  # The combined curve - the one that should follow the bars. Each component
+  # on its own only carries its share of the data, so it sits below them.
+  mix <- data.frame(x = xs, density = rowSums(dens_j))
 
   # Bar heights on the same (weighted) density scale ggplot draws them on, so
   # the y limit below is computed from exactly what is plotted.
@@ -416,9 +616,9 @@ plot_meal_mixture <- function(log_intervals, fit, threshold_log, weights = NULL,
                    aes(x = LogInterval, y = after_stat(density), weight = wt),
                    breaks = brks, fill = "grey85", colour = "white") +
     geom_line(data = comps, aes(x = x, y = density, colour = Component),
-              linewidth = 0.9) +
+              linewidth = 0.7, linetype = "22") +
     geom_line(data = mix, aes(x = x, y = density),
-              colour = "black", linewidth = 0.7, linetype = "dotted")
+              colour = "black", linewidth = 1.2)
 
   if (is.finite(threshold_log)) {
     p <- p +
@@ -430,9 +630,18 @@ plot_meal_mixture <- function(log_intervals, fit, threshold_log, weights = NULL,
                colour = "red", hjust = -0.06, size = 3.4, label.size = 0)
   }
 
-  # Say plainly what the eye cannot check: how much of the data sits on the
-  # single shortest interval, and which bars were cut off by the y limit.
+  # Say plainly what the eye cannot check: how closely the combined curve
+  # follows the bars, how much of the data sits on the single shortest
+  # interval, and which bars were cut off by the y limit.
+  gof <- mixture_fit_quality(log_intervals, weights, fit, bins = bins)
+
   notes <- character(0)
+  if (!is.null(gof) && is.finite(gof$bic)) {
+    notes <- c(notes, paste0("BIC ", format(round(gof$bic), big.mark = ","),
+                             " - lower is better, for comparing this against ",
+                             "other numbers of parts or the other curve shape ",
+                             "on the same data."))
+  }
   if (atom_share >= 0.05) {
     notes <- c(notes, paste0(round(100 * atom_share), "% of the ",
                              if (weighted) "mass" else "gaps",
@@ -453,11 +662,15 @@ plot_meal_mixture <- function(log_intervals, fit, threshold_log, weights = NULL,
     paste(strwrap(paste(notes, collapse = " "), width = 110), collapse = "\n") else NULL
 
   # Wrapped so it cannot run off the panel on a narrow screen.
-  subtitle <- paste0("Grey = ",
+  subtitle <- paste0("Grey bars = ",
                      if (weighted) "mass eaten after each gap" else "observed gaps",
                      if (dequantised) ", spread across the recording step" else "",
-                     "; ", length(fit$mu), " fitted components; ",
-                     "dotted = combined mixture; dashed red = meal threshold")
+                     "; black line = the fitted curve, which should follow them; ",
+                     "dashed colours = its ", length(fit$mu), " parts; ",
+                     "dashed red = meal threshold.",
+                     if (!is.null(gof) && is.finite(gof$r2))
+                       paste0(" The curve follows the bars ",
+                              round(100 * max(gof$r2, 0)), "% of the way.") else "")
   subtitle <- paste(strwrap(subtitle, width = 95), collapse = "\n")
 
   p +
@@ -482,22 +695,50 @@ plot_meal_mixture <- function(log_intervals, fit, threshold_log, weights = NULL,
 # distinction that matters is between the meal's span (which includes the
 # short pauses inside it) and the time actually spent eating.
 summarize_meals <- function(df) {
-  df <- as.data.table(copy(df))
-  if (!inherits(df$StartTime, "POSIXct")) df[, StartTime := as.POSIXct(StartTime)]
-  if (!inherits(df$EndTime,   "POSIXct")) df[, EndTime   := as.POSIXct(EndTime)]
+  # Take a copy of only the columns needed, which leaves the caller's table
+  # alone without duplicating the twenty-odd columns an upload can carry.
+  cols <- c("AnimalTag", "Visits", "StartTime", "EndTime", "DurationSec",
+            "MassDiffKg", "Feeder")
+  d <- as.data.table(df)[, ..cols]
+  if (!inherits(d$StartTime, "POSIXct")) d[, StartTime := as.POSIXct(StartTime)]
+  if (!inherits(d$EndTime,   "POSIXct")) d[, EndTime   := as.POSIXct(EndTime)]
+  tz <- attr(d$StartTime, "tzone")
+  if (is.null(tz)) tz <- ""
 
-  meals <- df[, .(
-    Date       = as.Date(min(StartTime)),
-    StartTime  = min(StartTime),
-    EndTime    = max(EndTime),
-    Events     = .N,
-    `Meal Length (min)` = round(as.numeric(difftime(max(EndTime), min(StartTime),
-                                                    units = "mins")), 1),
-    `Eating Time (min)` = round(sum(DurationSec, na.rm = TRUE) / 60, 1),
-    `Mass (Kg)`         = round(sum(MassDiffKg, na.rm = TRUE), 3),
-    Feeders             = uniqueN(Feeder)
-  ), by = .(AnimalTag, Meal = Visits)]
+  # Aggregate over plain numbers. min/max/sum/.N on a numeric column take
+  # data.table's optimised grouping path, whereas the same expressions wrapped
+  # in difftime(), as.Date() or uniqueN() - or taken over POSIXct - fall back
+  # to running R code once per group. With a meal per group that is >100k
+  # evaluations on a season of data, which is where the wait came from.
+  d[, `:=`(st_num = as.numeric(StartTime), en_num = as.numeric(EndTime))]
 
+  meals <- d[, .(st_num = min(st_num),
+                 en_num = max(en_num),
+                 Events = .N,
+                 eat_sec = sum(DurationSec, na.rm = TRUE),
+                 mass_kg = sum(MassDiffKg, na.rm = TRUE)),
+             by = .(AnimalTag, Meal = Visits)]
+
+  # Feeders per meal: one pass over the distinct animal/meal/feeder triples
+  # instead of a uniqueN() call inside every group.
+  feeders <- unique(d[, .(AnimalTag, Meal = Visits, Feeder)])[
+    , .(Feeders = .N), by = .(AnimalTag, Meal)]
+  meals[feeders, Feeders := i.Feeders, on = .(AnimalTag, Meal)]
+
+  # Everything else is a vectorised pass over the meals, not over the records.
+  meals[, `:=`(
+    StartTime           = as.POSIXct(st_num, origin = "1970-01-01", tz = tz),
+    EndTime             = as.POSIXct(en_num, origin = "1970-01-01", tz = tz),
+    `Meal Length (min)` = round((en_num - st_num) / 60, 1),
+    `Eating Time (min)` = round(eat_sec / 60, 1),
+    `Mass (Kg)`         = round(mass_kg, 3)
+  )]
+  meals[, Date := as.Date(StartTime)]
+  meals[, c("st_num", "en_num", "eat_sec", "mass_kg") := NULL]
+
+  setcolorder(meals, c("AnimalTag", "Meal", "Date", "StartTime", "EndTime",
+                       "Events", "Meal Length (min)", "Eating Time (min)",
+                       "Mass (Kg)", "Feeders"))
   setorder(meals, AnimalTag, StartTime)
   meals[]
 }
@@ -506,7 +747,15 @@ summarize_meals <- function(df) {
 # Per-animal summary of those meals: how many, how often, and what an average
 # meal looks like. Covers every animal in the dataset.
 summarize_visits <- function(df) {
-  meals <- summarize_meals(df)
+  summarize_meal_averages(summarize_meals(df))
+}
+
+
+# The averaging half of the summary, split out so a caller that already holds
+# the per-meal table (the app builds it once for both the table and its
+# download) does not pay for collapsing the records a second time.
+summarize_meal_averages <- function(meals) {
+  meals <- as.data.table(meals)
 
   out <- meals[, .(
     Meals                      = .N,

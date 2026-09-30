@@ -11,10 +11,27 @@ source('functions.R')
 options(shiny.maxRequestSize = 1000*1024^2) #10 GB to upload
 
 ui <- fluidPage(
+  # Working indicator ####
+  # Large uploads take a while with nothing on screen to say so. Shiny's own
+  # busy indicators put a pulse across the top of the page and a spinner on
+  # each output that is recalculating; the badge adds one unmissable marker
+  # that stays visible while anything at all is still running.
+  useBusyIndicators(),
+  tags$head(tags$style(HTML("
+    #busy_badge {
+      display: none; position: fixed; top: 10px; right: 14px; z-index: 2000;
+      background: #1f77b4; color: #fff; padding: 6px 14px; border-radius: 14px;
+      font-weight: 600; box-shadow: 0 1px 5px rgba(0, 0, 0, 0.35);
+    }
+    html.shiny-busy #busy_badge { display: block; }
+  "))),
+  div(id = "busy_badge", icon("spinner", class = "fa-spin"), "Working ..."),
+
   titlePanel("Animal Feeding Dashboard"),
  # sidebarLayout(
     sidebarPanel(
       fileInput("file", "Upload CSV or Excel"),
+      uiOutput("sheet_ui"),
       uiOutput("id_col_ui"),
       uiOutput("animal_selector"),
       #dateRangeInput("date_range", "Select Date Range")
@@ -35,16 +52,9 @@ ui <- fluidPage(
 
         checkboxInput("weight_by_mass",
                       "Let big feedings count more than small ones",
-                      value = TRUE),
+                      value = FALSE),
         helpText("Uses how much the animal actually ate, so a large feeding",
                  "counts for more than a quick nibble."),
-
-        checkboxInput("dequantise",
-                      "My times are recorded to the whole minute",
-                      value = FALSE),
-        helpText("Tick this if every time in the file ends in :00. The app then",
-                 "spreads those gaps out instead of treating them all as",
-                 "exactly one minute. It is ignored when times have seconds."),
 
         selectInput("mixture_k", "How many kinds of break to look for",
                     choices = c("2 - breaks within a meal, and breaks between meals" = 2,
@@ -52,7 +62,19 @@ ui <- fluidPage(
                                 "4 - for very detailed data"                         = 4),
                     selected = 2),
         helpText("Start with 2. Try 3 if the animals pause in the middle of a",
-                 "meal and those pauses are being counted as new meals.")
+                 "meal and those pauses are being counted as new meals."),
+
+        selectInput("mixture_family", "Shape of the short-break curve",
+                    choices = c("Even on both sides"       = "normal",
+                                "Leaning to one side"      = "weibull"),
+                    selected = "normal"),
+        helpText("Short breaks are often bunched near the low end rather than",
+                 "spread evenly around a middle value. The leaning shape can",
+                 "follow that better - the fit score on the figure tells you",
+                 "which one suits your data."),
+
+        helpText(tags$em(paste("Times recorded only to the whole minute are",
+                               "detected and handled automatically.")))
       ),
 
       downloadButton("download_data", "Download Resolved Dataset"),
@@ -98,13 +120,35 @@ server <- function(input, output, session) {
  
   # Raw upload, read before the animal identifier is known: the ID column is
   # chosen by the user, so reading must not assume a particular column name.
+  # Sheet names of an uploaded workbook; empty for a text file.
+  excel_sheet_names <- reactive({
+    req(input$file)
+    if (tolower(tools::file_ext(input$file$name)) %in% c("xlsx", "xls")) {
+      excel_sheets(input$file$datapath)
+    } else {
+      character(0)
+    }
+  })
+
+  # Only worth asking when the workbook actually holds more than one sheet.
+  output$sheet_ui <- renderUI({
+    sheets <- excel_sheet_names()
+    if (length(sheets) < 2) return(NULL)
+    selectInput("sheet", "Which sheet to read",
+                choices = sheets, selected = sheets[1])
+  })
+
   raw_data <- reactive({
     req(input$file)
     ext <- tools::file_ext(input$file$name)
 
     if (tolower(ext) %in% c("xlsx", "xls")) {
-      # Read Excel file
-      as.data.table(read_excel(input$file$datapath))
+      # Read the chosen sheet, falling back to the first one before the
+      # selector has rendered (or when there is only one sheet to read).
+      sheets <- excel_sheet_names()
+      sheet  <- if (!is.null(input$sheet) && input$sheet %in% sheets) input$sheet
+                else sheets[1]
+      as.data.table(read_excel(input$file$datapath, sheet = sheet))
     } else {
       # Read text-based file and find header line. Files that do not carry an
       # "AnimalTag" column are read from the first line; their identifier
@@ -296,8 +340,11 @@ server <- function(input, output, session) {
     df <- df[order(StartTime)]
     if (nrow(df) == 0) return(NULL)  # prevents rendering empty table
     #df[, overlap := shift(EndTime, type = "lag") > StartTime]
-    df[, StartTime := format(StartTime, "%Y-%m-%d %H:%M:%S")]
-    df[, EndTime := format(EndTime, "%Y-%m-%d %H:%M:%S")]
+    # StartTime and EndTime stay POSIXct here. They used to be formatted to
+    # text at this point, which every later step had to parse back: on a large
+    # upload the formatting and re-parsing cost far more than the rest of the
+    # analysis put together. Text is produced where it is actually shown or
+    # written out instead.
     if (input$overlap_action == "merge") {
       merge_df <- df[!is.na(overlap_id)]
       
@@ -372,9 +419,12 @@ server <- function(input, output, session) {
     # pins a component onto a zero-width spike at the rounding step. Spreading
     # each gap across the step it was rounded to feeds the fit a continuous
     # distribution; IntervalSec itself is left untouched, so the visits are
-    # still assigned from the recorded gaps.
-    model_sec <- df$IntervalSec
-    if (isTRUE(input$dequantise)) model_sec <- dequantise_intervals(model_sec)
+    # still assigned from the recorded gaps. The recording step is measured
+    # from the gaps themselves, so a file that already carries seconds passes
+    # through untouched and nobody has to know the term for any of this.
+    model_sec <- dequantise_intervals(df$IntervalSec)
+    step <- attr(model_sec, "grid")
+    dequantised <- !is.null(step) && is.finite(step) && step > 1
 
     keep <- is.finite(model_sec) & model_sec > 0
     log_intervals <- log(model_sec[keep])
@@ -394,14 +444,17 @@ server <- function(input, output, session) {
     k <- suppressWarnings(as.integer(input$mixture_k))
     if (!is.finite(k) || k < 2) k <- 2
 
-    fit <- fit_normal_mixture(log_intervals, k = k, w = weights)
+    family <- if (isTRUE(input$mixture_family == "weibull")) "weibull" else "normal"
+
+    fit <- fit_normal_mixture(log_intervals, k = k, w = weights, family = family)
     threshold_log <- mixture_intersection(fit)
 
     df <- assign_visits(df, threshold_log)
 
     list(df = df, fit = fit, threshold_log = threshold_log,
          log_intervals = log_intervals, weights = weights,
-         dequantised = isTRUE(input$dequantise))
+         dequantised = dequantised, step = step,
+         quality = mixture_fit_quality(log_intervals, weights, fit))
   })
 
 
@@ -426,7 +479,15 @@ server <- function(input, output, session) {
       return("There was not enough data to work out where meals start and end.")
 
     extras <- c(if (!is.null(md$weights)) "big feedings counted more than small ones",
-                if (isTRUE(md$dequantised)) "times treated as rounded to the minute")
+                if (isTRUE(md$dequantised))
+                  paste0("times found to be recorded in steps of ",
+                         fmt_interval(md$step), ", so the gaps were spread across that step"))
+
+    fit_note <- if (!is.null(md$quality) && is.finite(md$quality$r2))
+      paste0(" The fitted curve follows the shape of the data ",
+             round(100 * max(md$quality$r2, 0)),
+             "% of the way; if that looks low, try a different number of ",
+             "breaks or the other curve shape.") else ""
 
     paste0("Whenever an animal stopped eating for ",
            fmt_interval(exp(md$threshold_log)),
@@ -434,14 +495,15 @@ server <- function(input, output, session) {
            "Shorter breaks were treated as pauses within the same meal. ",
            "Worked out from ", length(md$fit$mu), " kinds of break",
            if (length(extras)) paste0(", with ", paste(extras, collapse = " and ")) else "",
-           ".")
+           ".", fit_note)
   })
 
   # Meal summary covers every animal in the dataset (not just the selected
   # one); the same all-animal table is used on screen and for download.
   visit_summary_data <- reactive({
-    md <- req(meal_data())
-    summarize_visits(md$df)
+    # Averaged from the per-meal table below rather than collapsing the
+    # records a second time.
+    summarize_meal_averages(req(meal_rows_data()))
   })
 
   # One row per meal, for anyone who wants the meals themselves rather than
@@ -666,7 +728,15 @@ server <- function(input, output, session) {
       # Assign a color per overlap_id
       df[, row_color := as.character(factor(overlap_id))]
       
-      DT::datatable(df[, .(overlap_id,AnimalTag, Feeder, StartTime, EndTime, DurationSec,MassDiffKg,Flags)],
+      # The table is the one place these timestamps are read as text, and by
+      # now it holds only the overlapping rows of one animal, so formatting
+      # here costs nothing.
+      shown <- df[, .(overlap_id, AnimalTag, Feeder, StartTime, EndTime,
+                      DurationSec, MassDiffKg, Flags)]
+      shown[, `:=`(StartTime = format(StartTime, "%Y-%m-%d %H:%M:%S"),
+                   EndTime   = format(EndTime,   "%Y-%m-%d %H:%M:%S"))]
+
+      DT::datatable(shown,
                     options = list(rowCallback = DT::JS(
                       "function(row, data, index) {",
                       "  var colors = ['#f2f2f2', '#d9edf7', '#fcf8e3', '#fbeed5', '#dff0d8'];",
@@ -683,3 +753,4 @@ server <- function(input, output, session) {
     )
 }
 shinyApp(ui = ui, server = server, options = list(launch.browser = TRUE))
+
