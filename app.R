@@ -33,9 +33,26 @@ ui <- fluidPage(
       fileInput("file", "Upload CSV or Excel"),
       uiOutput("sheet_ui"),
       uiOutput("id_col_ui"),
-      uiOutput("animal_selector"),
+      # The animal selector only applies to the Feeding and Overlaps tabs; the
+      # Meals tab summarises every animal, so it is hidden there
+      conditionalPanel("input.main_tabs != 'Meals'",
+                       uiOutput("animal_selector")),
       #dateRangeInput("date_range", "Select Date Range")
       uiOutput("date_ui"),
+
+      # Exclusions ####
+      # Rows can be left out of the whole analysis: specific days (e.g. a
+      # power cut) and any values of any column.
+      wellPanel(
+        h4("Remove from the data"),
+        uiOutput("exclude_dates_ui"),
+        uiOutput("exclude_col_ui"),
+        selectizeInput("exclude_values", "Values to remove",
+                       choices = NULL, multiple = TRUE),
+        actionButton("add_exclusion", "Remove these values"),
+        actionButton("clear_exclusions", "Clear all"),
+        uiOutput("exclusion_list")
+      ),
       numericInput("tolerance_sec", "Overlap Tolerance (seconds)", value = 0, min = 0, step = 1),
 
       uiOutput("overlap_ui"),
@@ -73,6 +90,13 @@ ui <- fluidPage(
                  "follow that better - the fit score on the figure tells you",
                  "which one suits your data."),
 
+        radioButtons("meal_fit_dates", "Work out the meal breaks from",
+                     choices = c("Selected filtered data only" = "range",
+                                 "All dates in the file" = "all"),
+                     selected = "range"),
+        helpText("Either way, only meals inside the selected dates are shown",
+                 "and downloaded."),
+
         helpText(tags$em(paste("Times recorded only to the whole minute are",
                                "detected and handled automatically.")))
       ),
@@ -85,6 +109,7 @@ ui <- fluidPage(
     ),
     mainPanel(
       tabsetPanel(
+        id = "main_tabs",
         type = "tabs",
         tabPanel(
           "Feeding",
@@ -215,6 +240,95 @@ server <- function(input, output, session) {
   })
   
   
+  # Exclusions ####
+  # Values are compared as text so any column type works; missing or empty
+  # values are shown as "(blank)".
+  exclusion_keys <- function(x) {
+    k <- as.character(x)
+    k[is.na(k) | k == ""] <- "(blank)"
+    k
+  }
+
+  # Removed values, as a named list: column name -> values to remove
+  excluded_values <- reactiveVal(list())
+  observeEvent(data(), excluded_values(list()))
+
+  output$exclude_dates_ui <- renderUI({
+    req(data())
+    # Every calendar day from the first to the last record, so days with no
+    # data at all (e.g. a power cut) show up too
+    rec_days <- as.Date(data()$StartTime)
+    rec_days <- rec_days[!is.na(rec_days)]
+    req(length(rec_days) > 0)
+    all_days <- seq(min(rec_days), max(rec_days), by = "day")
+    counts <- as.integer(table(factor(format(rec_days), levels = format(all_days))))
+
+    # A day with under half the usual number of records is flagged as low
+    typical <- median(counts[counts > 0])
+    empty <- counts == 0
+    low   <- !empty & counts < 0.5 * typical
+
+    labels <- format(all_days, "%Y-%m-%d")
+    labels[empty] <- paste0(labels[empty], " (no data)")
+    labels[low]   <- paste0(labels[low], " (only ", counts[low], " records)")
+
+    # Empty days first, then low days (fewest records first), then the rest
+    ord <- order(!empty, !low, ifelse(low, counts, 0), all_days)
+    choices <- setNames(format(all_days, "%Y-%m-%d"), labels)[ord]
+
+    selectizeInput("exclude_dates", "Leave out these days", choices = choices,
+                   selected = format(all_days[empty], "%Y-%m-%d"),
+                   multiple = TRUE,
+                   options = list(placeholder = "e.g. days with a power cut"))
+  })
+
+  output$exclude_col_ui <- renderUI({
+    req(data())
+    selectInput("exclude_col", "Remove values from column",
+                choices = names(data()))
+  })
+
+  observeEvent(input$exclude_col, {
+    req(data(), input$exclude_col %in% names(data()))
+    vals <- sort(unique(exclusion_keys(data()[[input$exclude_col]])))
+    updateSelectizeInput(session, "exclude_values", choices = vals,
+                         selected = character(0), server = TRUE)
+  })
+
+  observeEvent(input$add_exclusion, {
+    req(input$exclude_col, length(input$exclude_values) > 0)
+    rules <- excluded_values()
+    rules[[input$exclude_col]] <- union(rules[[input$exclude_col]],
+                                        input$exclude_values)
+    excluded_values(rules)
+    updateSelectizeInput(session, "exclude_values", selected = character(0))
+  })
+
+  observeEvent(input$clear_exclusions, excluded_values(list()))
+
+  output$exclusion_list <- renderUI({
+    rules <- excluded_values()
+    if (!length(rules)) return(helpText("No values removed."))
+    tags$ul(lapply(names(rules), function(col)
+      tags$li(tags$b(col), ": ", paste(rules[[col]], collapse = ", "))))
+  })
+
+  # Uploaded data with the removed values and left-out days taken out; every
+  # analysis starts from this
+  clean_data <- reactive({
+    df <- req(data())
+    rules <- excluded_values()
+    for (col in intersect(names(rules), names(df))) {
+      keep <- !(exclusion_keys(df[[col]]) %in% rules[[col]])
+      df <- df[keep]
+    }
+    if (length(input$exclude_dates)) {
+      keep <- !(as.Date(df$StartTime) %in% as.Date(input$exclude_dates))
+      df <- df[keep]
+    }
+    df
+  })
+
   output$animal_selector <- renderUI({
     req(data())
     selectInput("animal_tag", "Animal Tag", choices = unique(data()$AnimalTag))
@@ -228,7 +342,11 @@ server <- function(input, output, session) {
   filtered_data <- reactive({
     req(input$animal_tag, input$date_range)
     
-    df <- data()#[AnimalTag == input$animal_tag]
+    df <- clean_data()#[AnimalTag == input$animal_tag]
+    # Keep only events whose StartTime falls between the selected dates
+    # (both ends inclusive)
+    df <- df[as.Date(StartTime) >= input$date_range[1] &
+               as.Date(StartTime) <= input$date_range[2]]
     #Define overlap
     
     df = identify_overlap(df, input)
@@ -287,7 +405,8 @@ server <- function(input, output, session) {
                      paste0("Merge lower mass into higher (", round(ms$merge, 2), " kg)"),
                      paste0("Delete lower mass event (", round(ms$delete, 2), " kg)")
                    )
-                 )
+                 ),
+                 selected = "merge"
     )
   })
   
@@ -334,9 +453,8 @@ server <- function(input, output, session) {
   
   
   #
-  resolved_data <- reactive({
+  resolve_overlaps <- function(df) {
     req(input$overlap_action)
-    df <- req(filtered_data())
     df <- df[order(StartTime)]
     if (nrow(df) == 0) return(NULL)  # prevents rendering empty table
     #df[, overlap := shift(EndTime, type = "lag") > StartTime]
@@ -398,9 +516,20 @@ server <- function(input, output, session) {
       } else {
         list (df=df, solved_df=df[!is.na(overlap_id)])
       }
-    
-  
-})
+
+
+}
+
+  # Resolved data within the selected dates (used by every view)
+  resolved_data <- reactive({
+    resolve_overlaps(req(filtered_data()))
+  })
+
+  # Resolved data over every date in the file; only computed when the meal
+  # breaks are set to be worked out from all dates
+  resolved_all_data <- reactive({
+    resolve_overlaps(identify_overlap(copy(req(clean_data())), input))
+  })
   
   
   # Meal-interval analysis ####
@@ -410,10 +539,16 @@ server <- function(input, output, session) {
   # threshold from the component intersection and assigns per-animal visit
   # (meal) IDs.
   meal_data <- reactive({
-    df <- req(resolved_data()$df)
+    # Meal breaks are worked out either from the selected dates only or from
+    # every date in the file; the meals shown are always the selected dates.
+    fit_all_dates <- isTRUE(input$meal_fit_dates == "all")
+    df <- if (fit_all_dates) req(resolved_all_data()$df) else req(resolved_data()$df)
     if (nrow(df) == 0) return(NULL)
 
     df <- compute_meal_intervals(df)
+
+    # Breaks that run across a left-out day are not real breaks
+    df <- drop_gaps_over_days(df, input$exclude_dates)
 
     # Times stored to the whole minute make every gap a multiple of 60 s, which
     # pins a component onto a zero-width spike at the rounding step. Spreading
@@ -450,6 +585,13 @@ server <- function(input, output, session) {
     threshold_log <- mixture_intersection(fit)
 
     df <- assign_visits(df, threshold_log)
+
+    # Meals were found across all dates; keep only those in the selected dates
+    if (fit_all_dates) {
+      req(input$date_range)
+      df <- df[as.Date(StartTime) >= input$date_range[1] &
+                 as.Date(StartTime) <= input$date_range[2]]
+    }
 
     list(df = df, fit = fit, threshold_log = threshold_log,
          log_intervals = log_intervals, weights = weights,
@@ -628,7 +770,7 @@ server <- function(input, output, session) {
     
     req(input$animal_tag)
     req(input$date_range)
-    df <- req(data())[as.Date(StartTime) >= input$date_range[1] & 
+    df <- req(clean_data())[as.Date(StartTime) >= input$date_range[1] &
                         as.Date(StartTime) <= input$date_range[2]]
     if (nrow(df) == 0) return(NULL)  # prevents rendering empty table
     

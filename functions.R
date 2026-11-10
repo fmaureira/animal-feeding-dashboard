@@ -145,6 +145,32 @@ compute_meal_intervals <- function(df) {
 }
 
 
+# Gaps that run across a missing or left-out day (e.g. a power cut) are not a
+# real break the animal took, so they are blanked (NA): they stay out of the
+# mixture fit, and assign_visits starts a new meal after them. `days` are the
+# left-out dates; a gap is blanked if it overlaps any part of one of them.
+drop_gaps_over_days <- function(df, days) {
+  days <- unique(as.Date(days))
+  days <- days[!is.na(days)]
+  if (!length(days) || !nrow(df)) return(df)
+
+  tz <- attr(df$StartTime, "tzone")
+  if (is.null(tz)) tz <- ""
+  start    <- as.numeric(df$StartTime)
+  prev_end <- start - df$IntervalSec
+  day_start <- as.numeric(as.POSIXct(format(days), tz = tz))
+  day_end   <- as.numeric(as.POSIXct(format(days + 1), tz = tz))
+
+  spans <- rep(FALSE, nrow(df))
+  for (j in seq_along(days)) {
+    spans <- spans | (!is.na(prev_end) & prev_end < day_end[j] &
+                        start > day_start[j])
+  }
+  df[spans, `:=`(IntervalSec = NA_real_, LogInterval = NA_real_)]
+  df[]
+}
+
+
 # Largest time step the recorded intervals are consistent with: feeding times
 # are usually stored to the whole minute, which makes every derived gap a
 # multiple of 60 s. Returns 1 (no rounding detected) unless at least 90% of
